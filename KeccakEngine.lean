@@ -1,3 +1,4 @@
--- This module serves as the root of the `KeccakEngine` library.
--- Import modules here that should be built as part of the library.
-import KeccakEngine.Basic
+import KeccakEngine.Circuit
+import KeccakEngine.CircuitData
+import KeccakEngine.Sponge
+import KeccakEngine.SpongeTest

@@ -1,10 +1,7 @@
 name = "KeccakEngine"
 version = "0.1.0"
-defaultTargets = ["keccakengine"]
+defaultTargets = ["KeccakEngine"]
 
 [[lean_lib]]
 name = "KeccakEngine"
 
-[[lean_exe]]
-name = "keccakengine"
-root = "Main"
