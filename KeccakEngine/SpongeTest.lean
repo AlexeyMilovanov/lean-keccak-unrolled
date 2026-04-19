@@ -19,7 +19,7 @@ def mock_bytes : ByteArray := ⟨#[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8
 theorem endianness_is_correct : bytesToWordLE mock_bytes 0 = 0x8000000000000001#64 := by rfl
 
 def mock_state : Array (BitVec 64) := Array.replicate 25 (0#64)
-def new_state := absorbBlock mock_state mock_bytes 0
+def new_state := absorbBlock mock_state mock_bytes 0 config_keccak256.rateBytes
 
 theorem absorb_is_correct : new_state[0]! = 0x8000000000000001#64 ∧ new_state[1]! = 0#64 := by decide
 
@@ -27,13 +27,13 @@ theorem absorb_is_correct : new_state[0]! = 0x8000000000000001#64 ∧ new_state[
 /-! ## Padding Tests (Edge Cases) -/
 
 def danger_leftover : ByteArray := ⟨Array.replicate 135 (0 : UInt8)⟩
-def danger_padded := padBlock danger_leftover .ethereum
+def danger_padded := padBlock danger_leftover config_keccak256
 
 theorem padding_edge_case_is_correct :
   danger_padded.data.size = 136 ∧ danger_padded.data[135]! = 0x81 := by native_decide
 
 def empty_leftover : ByteArray := ⟨#[]⟩
-def empty_padded := padBlock empty_leftover .nist
+def empty_padded := padBlock empty_leftover config_sha3_256
 
 theorem padding_empty_case_is_correct :
   empty_padded.data[0]! = 0x06 ∧ empty_padded.data[135]! = 0x80 := by native_decide

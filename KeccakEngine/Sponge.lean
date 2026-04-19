@@ -1,17 +1,53 @@
 import Init.Data.BitVec
-import KeccakEngine.Circuit
-import KeccakEngine.CircuitData
+import KeccakEngine.Core
 
 /-!
 # SHA-3 Sponge Construction (Unrolled Engine)
 
-This module implements the Keccak sponge construction. It relies on a pre-generated,
-unrolled static circuit (`CircuitData.lean`) to perform the Keccak-f[1600] permutation.
+This module implements the Keccak sponge construction. It relies on the dual-engine
+architecture defined in `Core.lean` (`keccakF1600_core`) to perform the Keccak-f[1600] permutation.
 This architectural choice bypasses Lean's elaborator memory limits, allowing for fully
-computable Keccak hashes (and EVM selectors) at compile-time without axioms.
+computable Keccak hashes (and EVM selectors) at compile-time without axioms, while
+falling back to a fast C-like loop for runtime execution.
 -/
 
 namespace KeccakEngine
+
+/-- Configuration for the SHA-3 / Keccak family variants. -/
+structure SpongeConfig where
+  rateBytes : Nat
+  rateBytes_pos : rateBytes > 0
+  paddingByte : UInt8
+  outputBytes : Nat
+
+/-- Standard Ethereum Keccak-256 configuration. -/
+def config_keccak256 : SpongeConfig :=
+  { rateBytes := 136, rateBytes_pos := by decide, paddingByte := 0x01, outputBytes := 32 }
+
+/-- Standard NIST SHA3-224 configuration. -/
+def config_sha3_224 : SpongeConfig :=
+  { rateBytes := 144, rateBytes_pos := by decide, paddingByte := 0x06, outputBytes := 28 }
+
+/-- Standard NIST SHA3-256 configuration. -/
+def config_sha3_256 : SpongeConfig :=
+  { rateBytes := 136, rateBytes_pos := by decide, paddingByte := 0x06, outputBytes := 32 }
+
+/-- Standard NIST SHA3-384 configuration. -/
+def config_sha3_384 : SpongeConfig :=
+  { rateBytes := 104, rateBytes_pos := by decide, paddingByte := 0x06, outputBytes := 48 }
+
+/-- Standard NIST SHA3-512 configuration. -/
+def config_sha3_512 : SpongeConfig :=
+  { rateBytes := 72, rateBytes_pos := by decide, paddingByte := 0x06, outputBytes := 64 }
+
+/-- Standard NIST SHAKE-128 configuration (outputBytes is ignored in XOF). -/
+def config_shake_128 : SpongeConfig :=
+  { rateBytes := 168, rateBytes_pos := by decide, paddingByte := 0x1f, outputBytes := 0 }
+
+/-- Standard NIST SHAKE-256 configuration (outputBytes is ignored in XOF). -/
+def config_shake_256 : SpongeConfig :=
+  { rateBytes := 136, rateBytes_pos := by decide, paddingByte := 0x1f, outputBytes := 0 }
+
 
 /--
 Safely reads 1 byte from a `ByteArray`.
@@ -45,103 +81,45 @@ def bytesToWordLE (bytes : ByteArray) (offset : Nat) : BitVec 64 :=
 def safeSet (arr : Array (BitVec 64)) (idx : Nat) (val : BitVec 64) : Array (BitVec 64) :=
   arr.set! idx val
 
-/-- Absorbs exactly 136 bytes (17 words) into the Keccak state. -/
-def absorbBlock (state : Array (BitVec 64)) (bytes : ByteArray) (offset : Nat) : Array (BitVec 64) :=
+/-- Absorbs `rateBytes` into the Keccak state. -/
+def absorbBlock (state : Array (BitVec 64)) (bytes : ByteArray) (offset : Nat) (rateBytes : Nat) : Array (BitVec 64) :=
   let absorbWord (s : Array (BitVec 64)) (i : Nat) :=
     let word := bytesToWordLE bytes (offset + i * 8)
     let oldWord := s.getD i 0#64
     safeSet s i (oldWord ^^^ word)
 
-  let indices := [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  let rateWords := rateBytes / 8
+  let indices := List.range rateWords
   indices.foldl absorbWord state
 
-/-- Domain separation suffixes for Keccak variants. -/
-inductive HashVariant where
-  | ethereum
-  | nist
-  deriving Repr, Inhabited, DecidableEq
-
-/-- Returns the starting padding byte: `0x01` for Ethereum, `0x06` for NIST. -/
-@[always_inline, inline]
-def domainSuffix (v : HashVariant) : UInt8 :=
-  match v with
-  | .ethereum => 0x01
-  | .nist     => 0x06
-
-/-- Pads the message tail (0 to 135 bytes) to a full 136-byte block. -/
-def padBlock (leftover : ByteArray) (variant : HashVariant) : ByteArray :=
-  let rate := 136
-  let arr1 := leftover.data.push (domainSuffix variant)
-  let padLen := rate - arr1.size
+/-- Pads the message tail to a full block based on the sponge rate. -/
+def padBlock (leftover : ByteArray) (config : SpongeConfig) : ByteArray :=
+  let arr1 := leftover.data.push config.paddingByte
+  let padLen := config.rateBytes - arr1.size
   let arr2 := arr1 ++ Array.replicate padLen 0
-  let lastIdx := rate - 1
+  let lastIdx := config.rateBytes - 1
   let lastVal := arr2[lastIdx]? |>.getD 0
   let arr3 := arr2.set! lastIdx (lastVal ||| 0x80)
   ⟨arr3⟩
-
-/-- Kernel-friendly evaluation of a single bitwise instruction. -/
-@[always_inline, inline]
-def kernelEvalInstr (mem : Array (BitVec 64)) (inst : Instr) : Array (BitVec 64) :=
-  match inst with
-  | .xor a b       => mem.push (mem.getD a 0#64 ^^^ mem.getD b 0#64)
-  | .xor_const a c => mem.push (mem.getD a 0#64 ^^^ c)
-  | .and a b       => mem.push (mem.getD a 0#64 &&& mem.getD b 0#64)
-  | .not a         => mem.push (~~~mem.getD a 0#64)
-  | .rotl a n      => mem.push ((mem.getD a 0#64).rotateLeft n)
-
-/--
-Executes the Keccak-f[1600] permutation.
-Processes the 24 unrolled round chunks sequentially to manage elaborator memory.
--/
-def keccakF1600 (state : Array (BitVec 64)) : Array (BitVec 64) :=
-  let s1  := sha3_round_0.foldl kernelEvalInstr state
-  let s2  := sha3_round_1.foldl kernelEvalInstr s1
-  let s3  := sha3_round_2.foldl kernelEvalInstr s2
-  let s4  := sha3_round_3.foldl kernelEvalInstr s3
-  let s5  := sha3_round_4.foldl kernelEvalInstr s4
-  let s6  := sha3_round_5.foldl kernelEvalInstr s5
-  let s7  := sha3_round_6.foldl kernelEvalInstr s6
-  let s8  := sha3_round_7.foldl kernelEvalInstr s7
-  let s9  := sha3_round_8.foldl kernelEvalInstr s8
-  let s10 := sha3_round_9.foldl kernelEvalInstr s9
-  let s11 := sha3_round_10.foldl kernelEvalInstr s10
-  let s12 := sha3_round_11.foldl kernelEvalInstr s11
-  let s13 := sha3_round_12.foldl kernelEvalInstr s12
-  let s14 := sha3_round_13.foldl kernelEvalInstr s13
-  let s15 := sha3_round_14.foldl kernelEvalInstr s14
-  let s16 := sha3_round_15.foldl kernelEvalInstr s15
-  let s17 := sha3_round_16.foldl kernelEvalInstr s16
-  let s18 := sha3_round_17.foldl kernelEvalInstr s17
-  let s19 := sha3_round_18.foldl kernelEvalInstr s18
-  let s20 := sha3_round_19.foldl kernelEvalInstr s19
-  let s21 := sha3_round_20.foldl kernelEvalInstr s20
-  let s22 := sha3_round_21.foldl kernelEvalInstr s21
-  let s23 := sha3_round_22.foldl kernelEvalInstr s22
-  let memTape := sha3_round_23.foldl kernelEvalInstr s23
-
-  let extractWord (s : Array (BitVec 64)) (i : Nat) :=
-    let v_idx := final_vstate.getD i 0
-    s.set! i (memTape.getD v_idx 0#64)
-
-  let indices := [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24]
-  indices.foldl extractWord (Array.replicate 25 (0#64))
 
 /--
 Main Sponge Loop.
 Mathematically verified termination using `omega` to prove strict reduction of remaining bytes.
 -/
-def spongeLoop (state : Array (BitVec 64)) (data : ByteArray) (offset : Nat) (variant : HashVariant) : Array (BitVec 64) :=
+def spongeLoop (state : Array (BitVec 64)) (data : ByteArray) (offset : Nat) (config : SpongeConfig) : Array (BitVec 64) :=
   let remaining := data.size - offset
-  if h : remaining >= 136 then
-    let state' := absorbBlock state data offset
-    let state'' := keccakF1600 state'
-    have proof_of_termination : data.size - (offset + 136) < data.size - offset := by omega
-    spongeLoop state'' data (offset + 136) variant
+  if h : remaining >= config.rateBytes then
+    let state' := absorbBlock state data offset config.rateBytes
+    let state'' := keccakF1600_core state'
+    have proof_of_termination : data.size - (offset + config.rateBytes) < data.size - offset := by
+      have h_pos := config.rateBytes_pos
+      omega
+    spongeLoop state'' data (offset + config.rateBytes) config
   else
     let leftover := data.extract offset data.size
-    let padded := padBlock leftover variant
-    let state' := absorbBlock state padded 0
-    keccakF1600 state'
+    let padded := padBlock leftover config
+    let state' := absorbBlock state padded 0 config.rateBytes
+    keccakF1600_core state'
 termination_by data.size - offset
 
 /-- Converts a 64-bit word to 8 bytes (Little-Endian). -/
@@ -157,26 +135,37 @@ def wordToBytesLE (word : BitVec 64) : Array UInt8 :=
     UInt8.ofNat ((word >>> 56) &&& 0xFF#64).toNat
   ]
 
-/-- Extracts the first 32 bytes (256 bits) from the final state. -/
-def squeeze256 (state : Array (BitVec 64)) : ByteArray :=
-  let b0 := wordToBytesLE (state.getD 0 0#64)
-  let b1 := wordToBytesLE (state.getD 1 0#64)
-  let b2 := wordToBytesLE (state.getD 2 0#64)
-  let b3 := wordToBytesLE (state.getD 3 0#64)
-  ⟨b0 ++ b1 ++ b2 ++ b3⟩
+/-- Extracts the specified number of bytes from the final state. -/
+def squeeze (state : Array (BitVec 64)) (outBytes : Nat) : ByteArray :=
+  let outWords := outBytes / 8
+  let wordList := List.range outWords |>.map (fun i => wordToBytesLE (state.getD i 0#64))
+  let allBytes := wordList.foldl (· ++ ·) #[]
+  ⟨allBytes⟩
 
-def keccak256_core (data : ByteArray) (variant : HashVariant) : ByteArray :=
+def hash_core (data : ByteArray) (config : SpongeConfig) : ByteArray :=
   let initialState := Array.replicate 25 (0#64)
-  let finalState := spongeLoop initialState data 0 variant
-  squeeze256 finalState
+  let finalState := spongeLoop initialState data 0 config
+  squeeze finalState config.outputBytes
 
 /-- Computes the Keccak-256 hash (Ethereum standard). -/
 def keccak256 (data : ByteArray) : ByteArray :=
-  keccak256_core data .ethereum
+  hash_core data config_keccak256
+
+/-- Computes the SHA3-224 hash (NIST standard). -/
+def sha3_224 (data : ByteArray) : ByteArray :=
+  hash_core data config_sha3_224
 
 /-- Computes the SHA3-256 hash (NIST standard). -/
 def sha3_256 (data : ByteArray) : ByteArray :=
-  keccak256_core data .nist
+  hash_core data config_sha3_256
+
+/-- Computes the SHA3-384 hash (NIST standard). -/
+def sha3_384 (data : ByteArray) : ByteArray :=
+  hash_core data config_sha3_384
+
+/-- Computes the SHA3-512 hash (NIST standard). -/
+def sha3_512 (data : ByteArray) : ByteArray :=
+  hash_core data config_sha3_512
 
 /-- Computes the Keccak-256 hash of a UTF-8 encoded string. -/
 def keccak256_str (s : String) : ByteArray :=
